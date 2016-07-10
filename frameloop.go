@@ -112,9 +112,6 @@ func (s *Sim) Run() error {
 		default:
 		}
 
-		// Must occur on the main thread
-		glfw.PollEvents()
-
 		var (
 			now  = s.now()
 			sim  = s.simTime
