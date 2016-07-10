@@ -16,7 +16,6 @@ type OpFn func(frameTime float64, when time.Time)
 func (fn OpFn) Do(frameTime float64, when time.Time) { fn(frameTime, when) }
 
 type Sim struct {
-	Events   EventHandler
 	PreFrame Op
 	Frame    Op
 	Render   Op
