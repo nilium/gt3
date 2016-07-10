@@ -126,11 +126,10 @@ func (s *Sim) Run() error {
 			s.simTime = sim
 		}
 
-		// Reacquire current time and see if we're OK to render since the last render time
 		if s.rfps > 0 {
+			// Reacquire current time and see if we're OK to render since the last render time
 			now = s.now()
-			rt := s.renderTime
-			if now >= rt {
+			if rt := s.renderTime; now >= rt {
 				runOp(s.Render, sim, realtime(ubase, base, sim))
 				s.renderTime = now + s.rhz
 			}
