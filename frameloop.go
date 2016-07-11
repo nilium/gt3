@@ -1,19 +1,21 @@
 package gt3
 
 import (
+	"errors"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/go-gl/glfw/v3.2/glfw"
 )
 
 type Op interface {
-	Do(frameTime float64, when time.Time)
+	Do(step, frameTime float64, when time.Time)
 }
 
-type OpFn func(frameTime float64, when time.Time)
+type OpFn func(step, frameTime float64, when time.Time)
 
-func (fn OpFn) Do(frameTime float64, when time.Time) { fn(frameTime, when) }
+func (fn OpFn) Do(step, frameTime float64, when time.Time) { fn(step, frameTime, when) }
 
 type Sim struct {
 	PreFrame Op
@@ -21,39 +23,71 @@ type Sim struct {
 	Render   Op
 
 	fps  int // Simulation limitation
+	hz   float64
 	rfps int // Rendition limitation
+	rhz  float64
+
+	// Controls access to FPS/hertz variables
+	fpsrw sync.RWMutex
 
 	// Timing
-	hz         float64
-	rhz        float64
+	runTime    int64
 	baseTime   float64
 	simTime    float64
 	renderTime float64
-	runTime    int64
 
 	sched   chan Op
 	stopped <-chan struct{}
 }
 
-func NewSim(fps, rfps int, stop <-chan struct{}) *Sim {
+func NewSim(fps, renderfps int, stop <-chan struct{}) *Sim {
 	if fps <= 0 {
 		panic("gt3: simloop FPS must be > 0")
 	}
 
 	var rhz float64
-	if rfps > 0 {
-		rhz = 1.0 / float64(rfps)
+	if renderfps > 0 {
+		rhz = 1.0 / float64(renderfps)
 	}
 
 	return &Sim{
 		fps:  fps,
-		rfps: rfps,
+		rfps: renderfps,
 		hz:   1.0 / float64(fps),
 		rhz:  rhz,
 
-		sched:   make(chan Op),
 		stopped: stop,
 	}
+}
+
+var ErrBadFPS = errors.New("gt3: FPS must be > 0")
+
+func (s *Sim) SetRenderFPS(fps int) (previous int) {
+	s.fpsrw.Lock()
+	defer s.fpsrw.Unlock()
+
+	previous = s.rfps
+
+	s.rfps = fps
+	s.rhz = 1.0 / float64(fps)
+
+	return previous
+}
+
+func (s *Sim) SetFPS(fps int) (previous int, err error) {
+	if fps < 0 {
+		return 0, ErrBadFPS
+	}
+
+	s.fpsrw.Lock()
+	defer s.fpsrw.Unlock()
+
+	previous = s.fps
+
+	s.fps = fps
+	s.hz = 1.0 / float64(fps)
+
+	return previous, nil
 }
 
 func (s *Sim) Now() float64 {
@@ -71,30 +105,98 @@ func realtime(unixBase int64, base, after float64) time.Time {
 	return time.Unix(secs, nanos)
 }
 
-func (s *Sim) RealTime() time.Time {
+func (s *Sim) Seconds() float64 {
+	return s.simTime
+}
+
+func (s *Sim) Time() time.Time {
 	return realtime(s.runTime, s.baseTime, s.simTime)
 }
 
-func (s *Sim) pollSched(ft float64, rt time.Time) {
+func (s *Sim) RealTime() time.Time {
+	return realtime(s.runTime, s.baseTime, s.Now())
+}
+
+func (s *Sim) pollSched(hz, ft float64, rt time.Time) {
 	for sched := s.sched; ; {
 		select {
 		case op := <-sched:
-			op.Do(ft, rt)
+			op.Do(hz, ft, rt)
 		default:
 			return
 		}
 	}
 }
 
-func runOp(op Op, ft float64, rt time.Time) {
+func runOp(op Op, hz, ft float64, rt time.Time) {
 	if op != nil {
-		op.Do(ft, rt)
+		op.Do(hz, ft, rt)
 	}
 }
 
-func (s *Sim) frame(ft float64, rt time.Time) {
-	s.pollSched(ft, rt)
-	runOp(s.Frame, ft, rt)
+func (s *Sim) frame(hz, ft float64, rt time.Time) {
+	s.pollSched(hz, ft, rt)
+	runOp(s.Frame, hz, ft, rt)
+}
+
+var ErrStopped = errors.New("gt3: stopped")
+
+func (s *Sim) runSim(ubase int64, stopped <-chan struct{}) error {
+	select {
+	case <-stopped:
+		return ErrStopped
+	default:
+	}
+
+	s.fpsrw.RLock()
+	var (
+		now  float64
+		hz   float64
+		sim  = s.simTime
+		base = s.baseTime
+	)
+	s.fpsrw.RUnlock()
+
+	// Refresh hz per-frame
+	s.fpsrw.RLock()
+	hz = s.hz
+	s.fpsrw.RUnlock()
+
+	runOp(s.PreFrame, hz, sim, realtime(ubase, base, sim))
+
+	for now = s.Now(); sim < now; now = s.Now() {
+		s.frame(hz, sim, realtime(ubase, base, sim))
+		sim += hz
+		s.simTime = sim
+
+		if sim < now {
+			// Refresh hz per-frame
+			s.fpsrw.RLock()
+			hz = s.hz
+			s.fpsrw.RUnlock()
+		}
+	}
+
+	// Check if we need to limit rendition FPS
+	s.fpsrw.RLock()
+	var (
+		rlimit = s.rfps > 0
+		rhz    = s.rhz
+	)
+	s.fpsrw.RUnlock()
+
+	if rlimit {
+		// Reacquire current time and see if we're OK to render since the last render time
+		if rt := s.renderTime; now >= rt {
+			runOp(s.Render, hz, now, realtime(ubase, base, now))
+			s.renderTime = now + rhz
+		}
+	} else {
+		runOp(s.Render, hz, now, realtime(ubase, base, now))
+		s.renderTime = now
+	}
+
+	return nil
 }
 
 func (s *Sim) Run() error {
@@ -103,42 +205,14 @@ func (s *Sim) Run() error {
 	ubase := time.Now().Unix()
 	glfw.SetTime(0)
 
+	s.sched = make(chan Op)
 	s.runTime = ubase
 	s.simTime, s.baseTime = 0, glfw.GetTime()
 	for {
-		select {
-		case <-stopped:
-			return nil
-		default:
-		}
-
-		var (
-			now  = s.Now()
-			sim  = s.simTime
-			base = s.baseTime
-		)
-
-		runOp(s.PreFrame, sim, realtime(ubase, base, sim))
-
-		for hz := s.hz; sim+hz <= now; {
-			s.frame(sim, realtime(ubase, base, sim))
-			sim += hz
-			s.simTime = sim
-		}
-
-		if s.rfps > 0 {
-			// Reacquire current time and see if we're OK to render since the last render time
-			now = s.Now()
-			if rt := s.renderTime; now >= rt {
-				runOp(s.Render, sim, realtime(ubase, base, sim))
-				s.renderTime = now + s.rhz
-			}
-		} else {
-			runOp(s.Render, sim, realtime(ubase, base, sim))
+		if err := s.runSim(ubase, stopped); err != nil {
+			return err
 		}
 	}
-
-	return nil
 }
 
 // Sched schedules an op to run on the main goroutine. Sched does not wait for the op to run.
@@ -155,9 +229,9 @@ func (s *Sim) Sched(op Op) {
 // goroutine, Sync will deadlock the process.
 func (s *Sim) Sync(op Op) {
 	done := make(chan struct{})
-	syncOp := OpFn(func(ft float64, w time.Time) {
+	syncOp := OpFn(func(hz, ft float64, w time.Time) {
 		defer close(done)
-		op.Do(ft, w)
+		op.Do(hz, ft, w)
 	})
 
 	select {
