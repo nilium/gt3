@@ -56,7 +56,7 @@ func NewSim(fps, rfps int, stop <-chan struct{}) *Sim {
 	}
 }
 
-func (s *Sim) now() float64 {
+func (s *Sim) Now() float64 {
 	return glfw.GetTime() - s.baseTime
 }
 
@@ -113,7 +113,7 @@ func (s *Sim) Run() error {
 		}
 
 		var (
-			now  = s.now()
+			now  = s.Now()
 			sim  = s.simTime
 			base = s.baseTime
 		)
@@ -128,7 +128,7 @@ func (s *Sim) Run() error {
 
 		if s.rfps > 0 {
 			// Reacquire current time and see if we're OK to render since the last render time
-			now = s.now()
+			now = s.Now()
 			if rt := s.renderTime; now >= rt {
 				runOp(s.Render, sim, realtime(ubase, base, sim))
 				s.renderTime = now + s.rhz
